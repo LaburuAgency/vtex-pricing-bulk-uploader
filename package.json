@@ -1,0 +1,19 @@
+{
+  "name": "vtex-pricing-bulk-uploader",
+  "version": "1.0.0",
+  "description": "Bulk price updater for VTEX using CSV data",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "csv-parser": "^3.0.0",
+    "dotenv": "^16.3.0",
+    "p-limit": "^4.0.0"
+  },
+  "keywords": ["vtex", "pricing", "bulk", "csv"],
+  "author": "",
+  "license": "MIT"
+}
