@@ -2,7 +2,7 @@ require('dotenv').config();
 const fs = require('fs');
 const csv = require('csv-parser');
 const axios = require('axios');
-const pLimit = require('p-limit');
+const { default: pLimit } = require('p-limit');
 
 const config = {
   accountName: process.env.VTEX_ACCOUNT_NAME,
@@ -12,8 +12,11 @@ const config = {
   rateLimit: parseInt(process.env.RATE_LIMIT) || 2
 };
 
+console.table(config);
+
 const limit = pLimit(config.rateLimit);
-const baseURL = `https://${config.accountName}.vtexcommercestable.com.br/api`;
+const baseURL = `https://api.vtex.com/${config.accountName}`;
+const catalogURL = `https://${config.accountName}.vtexcommercestable.com.br/api`;
 
 function validateConfig() {
   if (!config.accountName || !config.appKey || !config.appToken) {
@@ -28,35 +31,94 @@ function validateConfig() {
 function parsePrice(priceString) {
   if (!priceString) return null;
   
-  const cleanPrice = priceString
-    .replace(/[\$\s,]/g, '')
-    .replace(/\./g, '');
+  const cleanPrice = priceString.replace(/[\$\s,]/g, '').trim();
   
-  const price = parseInt(cleanPrice);
-  return isNaN(price) ? null : price;
+  const price = parseFloat(cleanPrice);
+  if (isNaN(price)) return null;
+  
+  return Math.round(price * 100);
 }
 
-function readCSV() {
+async function getSkuIdFromRefId(refId) {
+  try {
+    const url = `${catalogURL}/catalog/pvt/stockkeepingunit?RefId=${refId}`;
+    
+    const response = await axios.get(url, {
+      headers: {
+        'X-VTEX-API-AppKey': config.appKey,
+        'X-VTEX-API-AppToken': config.appToken,
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    });
+
+    // console.log('response', response.data);
+
+    if (response.data && response.data.length > 0) {
+      return response.data[0].Id; // El SKU ID está en el campo Id
+    }
+    
+    return null;
+  } catch (error) {
+    console.error(`❌ Error getting SKU ID for RefId ${refId}:`, error.response?.data || error.message);
+    return null;
+  }
+}
+
+async function readCSV() {
   return new Promise((resolve, reject) => {
-    const results = [];
+    const rawResults = [];
     
     fs.createReadStream(config.csvFilePath)
       .pipe(csv())
       .on('data', (row) => {
-        const sku = row['Parte'];
+        const refId = row['Parte'];
         const priceString = row[' Precio Base.'] || row['Precio Base.'] || row['Precio Base'];
         const basePrice = parsePrice(priceString);
         
-        if (sku && basePrice !== null) {
-          results.push({
-            itemId: sku,
+        if (refId && basePrice !== null) {
+          rawResults.push({
+            refId: refId,
             basePrice: basePrice
           });
         }
       })
-      .on('end', () => {
-        console.log(`📊 Found ${results.length} products to update`);
-        resolve(results);
+      .on('end', async () => {
+        // Process all products
+        const limitedResults = rawResults;
+        
+        console.log(`📊 Found ${limitedResults.length} products with Reference IDs`);
+        console.log(`🔄 Converting Reference IDs to SKU IDs...`);
+        
+        try {
+          const results = [];
+          
+          // Process with rate limiting
+          const promises = limitedResults.map((item, index) => 
+            limit(async () => {
+              const skuId = await getSkuIdFromRefId(item.refId);
+              console.log(`🔄 RefId ${item.refId} → SKU ID ${skuId}`);
+              
+              if (skuId) {
+                console.log(`✅ [${index + 1}/${limitedResults.length}] RefId ${item.refId} → SKU ID ${skuId}`);
+                results.push({
+                  itemId: skuId,
+                  refId: item.refId,
+                  basePrice: item.basePrice
+                });
+              } else {
+                console.log(`❌ [${index + 1}/${limitedResults.length}] Could not find SKU ID for RefId ${item.refId}`);
+              }
+            })
+          );
+          
+          await Promise.all(promises);
+          
+          console.log(`📊 Successfully converted ${results.length} products`);
+          resolve(results);
+        } catch (error) {
+          reject(error);
+        }
       })
       .on('error', reject);
   });
@@ -67,11 +129,8 @@ async function updatePrice(itemId, basePrice) {
     const url = `${baseURL}/pricing/prices/${itemId}`;
     
     const priceData = {
-      itemId: itemId,
       basePrice: basePrice,
-      costPrice: null,
-      markup: null,
-      fixedPrices: []
+      costPrice: basePrice
     };
 
     const response = await axios.put(url, priceData, {
@@ -83,42 +142,7 @@ async function updatePrice(itemId, basePrice) {
       timeout: 30000
     });
 
-    return {
-      success: true,
-      itemId,
-      basePrice,
-      status: response.status
-    };
-  } catch (error) {
-    return {
-      success: false,
-      itemId,
-      basePrice,
-      error: error.response?.data || error.message
-    };
-  }
-}
-
-async function updatePrices() {
-  try {
-    console.log('🚀 Starting VTEX price update process...');
-    
-    validateConfig();
-    
-    const products = await readCSV();
-    
-    if (products.length === 0) {
-      console.log('❌ No valid products found in CSV');
-      return;
-    }
-
-    console.log(`📈 Updating ${products.length} prices with rate limit of ${config.rateLimit} requests/second`);
-    
-    const results = {
-      successful: 0,
-      failed: 0,
-      errors: []
-    };
+    return { success: true, itemId, basePrice, status: response.status }; } catch (error) { return { success: false, itemId, basePrice, error: error.response?.data || error.message }; } } async function updatePrices() { try { console.log('🚀 Starting VTEX price update process...'); validateConfig(); const products = await readCSV(); if (products.length === 0) { console.log('❌ No valid products found in CSV'); return; } console.log(`📈 Updating ${products.length} prices with rate limit of ${config.rateLimit} requests/second`); const results = { successful: 0, failed: 0, errors: [] };
 
     const promises = products.map((product, index) => 
       limit(async () => {
@@ -126,7 +150,7 @@ async function updatePrices() {
         
         if (result.success) {
           results.successful++;
-          console.log(`✅ [${index + 1}/${products.length}] Updated ${product.itemId}: $${product.basePrice}`);
+          console.log(`✅ [${index + 1}/${products.length}] Updated SKU ID ${product.itemId} (RefId: ${product.refId}): $${(product.basePrice/100).toFixed(2)}`);
         } else {
           results.failed++;
           results.errors.push(result);
